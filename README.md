@@ -10,6 +10,9 @@ Abstract: *Energy Natural gradient methods for PINNs and Deep Ritz.*
 - Pytest 7.2.0 or later
 - Matplotlib 3.6.1 or later
 
+- jaxtyping ?.?.?
+- typeguard ?.?.?
+
 ## Usage
 I suggest looking at the examples. Everything is still rough.
 
