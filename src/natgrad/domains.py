@@ -99,7 +99,7 @@ class Domain():
             key = random.split(key, num=1)[0]
             N = len(still_outside)
         return x
-
+    
 class Polygon(Domain):
     def __init__(self, vertices: FloatArrayN2):
         self._vertices = jnp.array(vertices)
