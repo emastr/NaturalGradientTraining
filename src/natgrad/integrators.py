@@ -63,6 +63,27 @@ class EvolutionaryIntegrator():
         # advance random number generator
         self._key = random.split(self._key[0], num=1)
 
+class RandomIntegrator():
+    """
+    Monte Carlo Integration
+    """
+    def __init__(self, domain, key, N=50):
+        self._domain = domain
+        self._N = N
+        self._x = self._domain.random_integration_points(key, self._N)
+        self._key = random.split(key, num=1)[0]
+        
+
+    def __call__(self, f):
+        """
+        Integration happens here, f must map (n,...) to (n,...)
+        """
+        return self._domain.measure() * jnp.mean(f(self._x), axis=0)
+
+    def update(self):
+        self._x = self._domain.random_integration_points(self._key, self._N)
+        self._key = random.split(self._key, num=1)[0]
+
 class TrapezoidalIntegrator():
     """
     Integration over intervals using trapezoidal rule.
