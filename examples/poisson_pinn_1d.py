@@ -1,7 +1,7 @@
-# export XLA_FLAGS=--xla_gpu_force_compilation_parallelism=1
 import jax
 import jax.numpy as jnp
 from jax import random, grad, vmap, jit
+from matplotlib import pyplot as plt
 
 import natgrad.mlp as mlp
 from natgrad.domains import Interval
@@ -12,6 +12,7 @@ from natgrad.inner import model_laplace, model_identity
 from natgrad.gram import gram_factory, nat_grad_factory
 from natgrad.utility import grid_line_search_factory
 
+jax.config.update('jax_platform_name', 'cpu')
 jax.config.update("jax_enable_x64", True)
 
 # random seed
@@ -26,11 +27,11 @@ boundary = PointBoundary(((a, b)))
 # integrators
 interior_integrator = DeterministicIntegrator(interior, 30)
 boundary_integrator = DeterministicIntegrator(boundary, 30)
-eval_integrator = DeterministicIntegrator(interior, 200)
+eval_integrator = DeterministicIntegrator(interior, 300)
 
 # model
 activation = lambda x : jnp.tanh(x)
-layer_sizes = [1, 32, 1]
+layer_sizes = [1, 16, 1]
 params = mlp.init_params(layer_sizes, random.PRNGKey(seed))
 model = mlp.mlp(activation)
 v_model = vmap(model, (None, 0))
@@ -39,12 +40,13 @@ v_model = vmap(model, (None, 0))
 @jit
 def u_star(x):
     x = x[0]
-    return jnp.sin(jnp.pi * x) 
+    return jnp.sin(jnp.pi*x)
 
 # rhs
 @jit
 def f(x):
-    return 2. * jnp.pi**2 * u_star(x)
+    x = x[0]
+    return jnp.pi**2 * jnp.sin(jnp.pi*x) 
 
 # gramians
 gram_bdry = gram_factory(
@@ -101,7 +103,7 @@ def l2_norm(f, integrator):
     return integrator(lambda x: (f(x))**2)**0.5    
    
 # natural gradient descent with line search
-for iteration in range(400):
+for iteration in range(1000):
     grads = grad(loss)(params)
     nat_grads = nat_grad(params, grads)
     params, actual_step = ls_update(params, nat_grads)
@@ -115,3 +117,12 @@ for iteration in range(400):
             f'NG Iteration: {iteration} with loss: {loss(params)} with error '
             f'L2: {l2_error} and error H1: {h1_error} and step: {actual_step}'
         )
+
+points = jnp.linspace(a, b, 100).reshape(-1, 1)
+plt.plot(points, (jnp.sin(jnp.pi * points)), label=r'$u^{*}(x)$')
+plt.plot(points, [model(params, point) for point in points], '.', label=r'$f(x; \theta)$')
+plt.legend()
+plt.xlabel('x')
+plt.ylabel('u(x)')
+plt.show()
+

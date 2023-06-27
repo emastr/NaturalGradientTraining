@@ -13,6 +13,7 @@ from natgrad.gram import gram_factory, nat_grad_factory
 from natgrad.utility import grid_line_search_factory
 
 jax.config.update("jax_enable_x64", True)
+jax.config.update('jax_platform_name', 'cpu')
 
 # random seed
 seed = 2
