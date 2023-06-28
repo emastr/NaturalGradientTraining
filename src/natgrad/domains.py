@@ -11,14 +11,157 @@ Contains the implementation of the computational domains.
 """
 
 import jax.numpy as jnp
-from jax import random
+from jax import random, vmap
 import math
 
-from typing import Any
-from jaxtyping import Array, Float, jaxtyped
+from typing import Any, Callable, Union
+from jaxtyping import Array, Float, Int, jaxtyped
 from typeguard import typechecked as typechecker
+from natgrad.types import FloatArrayN1, FloatArrayN2, FloatArrayN3, FloatArrayNd, PointType
 
-class Hyperrectangle():
+
+class Domain():
+    """
+    Abstract class for computational domains.
+
+    """
+    def __init__(self):
+        pass
+
+    def dim(self) -> int:
+        """
+        Returns the dimension of the domain.
+
+        """
+        raise NotImplementedError
+
+    def measure(self) -> float:
+        """
+        Returns the measure of the domain.
+        
+        """
+        raise NotImplementedError
+
+    def boundary(self) -> 'Domain':
+        """
+        Returns the boundary of the domain.
+
+        """
+        raise NotImplementedError
+    
+    def inside(self, x: PointType) -> bool:
+        """
+        Returns True if x is inside the domain.
+        """
+        raise NotImplementedError
+    
+    def mask(self, x: PointType) -> float:
+        """
+        Returns a mask for the domain.
+
+        """
+        return self.inside(x).astype(float)
+    
+    def bounding_box(self) -> 'Hyperrectangle':
+        """
+        Returns the bounding box of the domain.
+
+        """
+        raise NotImplementedError
+
+    def random_integration_points(self, key, N: int) -> FloatArrayNd:
+        """
+        Returns N random integration points in the domain.
+
+        """
+        # Try rejection sampling with bbox
+        return self.rejection_sample(key, N, vmap(self.inside, (0)), self.bounding_box())
+
+    def deterministic_integration_points(self, N: int) -> FloatArrayNd:
+        """
+        Returns N deterministic integration points in the domain.
+
+        """
+        raise NotImplementedError
+    
+    @staticmethod
+    def rejection_sample(key, N, mask, sample_domain):
+        """
+        Rejection sampling from a subdomain specified by boolean mask function.
+
+        """
+        x = jnp.zeros((N, sample_domain.dim()))
+        still_outside = jnp.arange(0, N, dtype=int)
+        while N > 0:
+            new_samples = sample_domain.random_integration_points(key, N)
+            x = x.at[still_outside].set(new_samples)
+            still_outside = still_outside[~mask(new_samples)]
+            key = random.split(key, num=1)[0]
+            N = len(still_outside)
+        return x
+    
+class Polygon(Domain):
+    def __init__(self, vertices: FloatArrayN2):
+        self._vertices = jnp.array(vertices)
+        self._l_bounds = jnp.min(self._vertices, axis=0)
+        self._r_bounds = jnp.max(self._vertices, axis=0)
+        self._dimension: int = 2
+        self._measure: float = self.find_measure(self._vertices)
+        
+    def dim(self):
+        return self._dimension
+    
+    def measure(self) -> float:
+        return self._measure
+    
+    def boundary(self) -> 'Domain':
+        return PolygonBoundary(self._vertices)
+    
+    def inside(self, x: PointType) -> bool:
+        normal = jnp.array([1., 0.])
+        return self.count_ray_collisions(x, normal, self._vertices) % 2 == 1
+    
+    def bounding_box(self) -> 'Hyperrectangle':
+        return Hyperrectangle(((self._l_bounds[0], self._r_bounds[0]), 
+                               (self._l_bounds[1], self._r_bounds[1])))
+    
+    @staticmethod
+    def find_measure(vertices: FloatArrayN2) -> float:
+        roll_verts = jnp.roll(vertices, 1, axis=0)
+        measure = 0.5 * sum((vertices[:, 0] + roll_verts[:, 0]) * (vertices[:, 1] - roll_verts[:, 1]))
+        return measure
+    
+    @staticmethod
+    def count_ray_collisions(x: PointType, dir: PointType, vertices: FloatArrayN2) -> int:
+        """
+        Counts the number of collisions of a ray with the polygon.
+        
+        """
+        collides = vmap(lambda a, b: Polygon.collides_with_segment(x, dir, a, b), (0, 0))
+        return jnp.sum(collides(vertices, jnp.roll(vertices, -1, axis=0)).astype(int))
+
+    @staticmethod
+    def collides_with_segment(x: PointType, dir: PointType, a: PointType, b: PointType) -> bool:
+        """
+        Checks if a ray collides with a line segment.
+        Check first if the line spanned by dir coollides with the line segment.
+        Then check if the intersection point is in the same halfplane as dir points.
+        """
+        normal = jnp.array([dir[1], -dir[0]])
+        line_collides = jnp.dot(normal, b - x) * jnp.dot(normal, a - x) < 0 
+        same_halfplane = jnp.dot(Polygon.intersection_point(x, dir, a, b) - x, dir) > 0
+        return line_collides & same_halfplane
+        
+        
+    @staticmethod
+    def intersection_point(x: PointType, dir: PointType, a: PointType, b: PointType) -> PointType:
+        """
+        Finds the intersection point of a ray with a line segment.
+        
+        """
+        return x + jnp.cross(a - x, b - x) / jnp.cross(dir, b - a) * dir
+    
+class Hyperrectangle(Domain):
     """
     A product of intervals in R^d.
     
@@ -76,17 +219,30 @@ class Hyperrectangle():
 
         self._dimension = len(self._l_bounds)
 
+    def bounding_box(self) -> 'Hyperrectangle':
+        return self
+
+    def dim(self):
+        return self._dimension
 
     def measure(self) -> float:
         return jnp.product(self._r_bounds - self._l_bounds)
 
+    def inside(self, x: PointType) -> bool:
+        """
+        Checks if x is inside the hyperrectangle.
+        
+        Parameters
+        ----------
+        x: Float[Array, "d"]
+            A point in R^d.
+
+        """
+        return jnp.all((self._l_bounds <= x) & (x <= self._r_bounds))
+
     @jaxtyped
     @typechecker
-    def random_integration_points(
-                self, 
-                key: Any, 
-                N: int = 50
-           ) -> Float[Array, "N d"]:
+    def random_integration_points(self, key: Any, N: int = 50) -> FloatArrayNd:
         """
         N uniformly drawn collocation points in the hyperrectangle.
         
@@ -111,12 +267,10 @@ class Hyperrectangle():
                 ),
         )
 
+    
     @jaxtyped
     @typechecker
-    def distance_function(
-                self, 
-                x: Float[Array, "d"]
-           ) -> Float[Array, ""]:
+    def distance_function(self, x: Float[Array, "d"]) -> Float[Array, ""]:
         """
         A smooth approximation of the distance fct to the boundary.
 
@@ -151,13 +305,13 @@ class Cube(Hyperrectangle):
             )
         self._a = a
         super().__init__(((0., a), (0., a), (0., a)))
+    
+    def boundary(self) -> Domain:
+        return CubeBoundary(self._a)
 
     @jaxtyped
     @typechecker
-    def deterministic_integration_points(
-                self, 
-                N: int,
-           ) -> Float[Array, "N 3"]:
+    def deterministic_integration_points(self, N: int,) -> FloatArrayN3:
         """
         Grid based integration points.
 
@@ -202,12 +356,12 @@ class Square(Hyperrectangle):
         self._a = a
         super().__init__(((0., a), (0., a)))
 
+    def boundary(self) -> Domain:
+        return SquareBoundary(self._a)
+    
     @jaxtyped
     @typechecker
-    def deterministic_integration_points(
-                self, 
-                N: int,
-           ) -> Float[Array, "N 2"]:
+    def deterministic_integration_points(self, N: int, ) -> FloatArrayN2:
         """
         Grid based integration points.
 
@@ -258,10 +412,7 @@ class Interval(Hyperrectangle):
         
     @jaxtyped
     @typechecker
-    def deterministic_integration_points(
-                self, 
-                N: int = 50
-           ) -> Float[Array, "N 1"]:
+    def deterministic_integration_points(self, N: int = 50) -> FloatArrayN1:
         """
         N equally spaced collocation points in [a, b].
         
@@ -309,7 +460,7 @@ class PointBoundary():
         
         return jnp.asarray([a, b]).reshape(2, 1) 
     
-class RectangleBoundary():
+class RectangleBoundary(Domain):
     """
     One side of a rectangle as a domain.
     
@@ -378,11 +529,7 @@ class RectangleBoundary():
         return sum
 
     @typechecker
-    def random_integration_points(
-                self,
-                key,
-                N: int = 50
-           ) -> Float[Array, "N 2"]:
+    def random_integration_points(self, key, N: int = 50) -> FloatArrayN2:
         
         keys = random.split(key, num=4)
         
@@ -425,10 +572,7 @@ class RectangleBoundary():
             )
     
     @typechecker    
-    def deterministic_integration_points(
-                self, 
-                N: int
-           ) -> Float[Array, "N 2"]:
+    def deterministic_integration_points(self, N: int) -> FloatArrayN2:
         
         # rectangle = [a_0, b_0] x [a_1, b_1]
         a_0 = self._l_bounds[0]
@@ -498,8 +642,43 @@ class SquareBoundary(RectangleBoundary):
 
         super().__init__(((0., a), (0., a)), side_number=side_number)
 
+class PolygonBoundary(Domain):
+    """
+    Boundary of a polygon. The polygon is given by its vertices.
+    No check if the vertices are in the right order is performed.
+    """
+    def __init__(self, vertices: FloatArrayN2):
+        """
+        Constructor that sets the vertices of the polygon.
+        """
+        self._vertices = vertices
+        self._N = vertices.shape[0]
+        self._dim = 1
+        self._lengths = self.find_edge_lengths(vertices)
+        self._cum_lengths = jnp.cumsum(self._lengths)
+        self._measure = self._cum_lengths[-1]
+    
+    def measure(self) -> float:
+        return self._measure
+        
+    def dim(self) -> int:
+        return self._dim
+    
+    def random_integration_points(self, key: random.KeyArray, N: int) -> FloatArrayNd:
+        uniform = random.uniform(key, (N,))
+        edge_idx = jnp.searchsorted(self._cum_lengths / self._measure, uniform)
+        weight = (self._cum_lengths[edge_idx] - self._measure * uniform) / self._lengths[edge_idx]
+        return self._vertices[edge_idx] + weight[:, None] * (self._vertices[(edge_idx + 1) % self._N] - self._vertices[edge_idx])
+
+    
+    @staticmethod
+    def find_edge_lengths(vertices: FloatArrayN2) -> FloatArrayN1:
+        roll_verts = jnp.roll(vertices, -1, axis=0)
+        lengths = jnp.linalg.norm(vertices - roll_verts, axis=1)
+        return lengths
+
 # just a preliminary implementation
-class CubeBoundary():
+class CubeBoundary(Domain):
     """
     Constructor that sets side-length, i.e., the cube is [0, a]^3
     
@@ -515,11 +694,11 @@ class CubeBoundary():
 
         self._a = a
 
-    def measure(self):
-        return self._a * self._a #?
+    def measure(self) -> float:
+        return self._a * self._a
 
     # N is number of points in [0,1]
-    def deterministic_integration_points(self, N):
+    def deterministic_integration_points(self, N: int) -> FloatArrayN3:
         square = Square(self._a)
         x = square.deterministic_integration_points(N)
         zeros = jnp.zeros((len(x)))

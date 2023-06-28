@@ -2,7 +2,9 @@
 
 **Natural Gradients and More**
 
-Abstract: *Energy Natural gradient methods for PINNs and Deep Ritz.*
+
+Abstract: *Energy Natural gradient methods for PINNs and Deep Ritz. Cloned from Dr. Zeinhofer's library.*
+
 
 ## Requirements
 - Python 3.10.10 or later
