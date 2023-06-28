@@ -128,7 +128,8 @@ class LevenbergMarquardt(base.IterativeSolver):
   has_aux: bool = False
   jit: base.AutoOrBoolean = 'auto'
   unroll: base.AutoOrBoolean = 'auto'
-  callback: Callable
+  callback: Callable = lambda *x: None
+
   # We are overriding the _cond_fun of the base solver to enable stopping based
   # on gradient or delta_params
   def _cond_fun(self, inputs):
@@ -406,7 +407,7 @@ class LevenbergMarquardt(base.IterativeSolver):
         hess_res=hess_res,
         aux=aux)
     
-    self.callback(params, state)
+    self.callback(params, delta_params, state)
 
     return base.OptStep(params=params, state=state)
 
