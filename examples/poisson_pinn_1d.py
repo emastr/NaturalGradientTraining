@@ -15,18 +15,21 @@ from natgrad.derivatives import laplace
 from natgrad.inner import model_laplace, model_identity
 from natgrad.gram import gram_factory, nat_grad_factory, nat_grad_factory_generic
 from natgrad.utility import grid_line_search_factory
+from natgrad.plotting import poission_1d_plot
 
 jax.config.update('jax_platform_name', 'cpu')
 jax.config.update("jax_enable_x64", True)
 
-# random seed
-seed = 2
-a = 0.
-b = 1.
-omega = 4.
-eps = 1e-4
+# random seed and parameters
+seed       = 2
+a          = 0.
+b          = 1.
+omega      = 4.
+eps        = 1e-4
+iterations = 250
+plot       = True
 
-conj_grad=lambda A, b: cg(A, b, maxiter=500)[0]
+conj_grad=lambda A, b: cg(A, b, maxiter=100)[0]
 least_sqs=lambda A, b: lstsq(A, b, rcond=1e-10)[0]
 
 # domains
@@ -79,7 +82,7 @@ def gram(params, eps=0):
     #return gram_ + eps * jnp.eye(gram_.shape[0]) * grad_norm_ ** 0.5
     return gram_ + eps * jnp.eye(gram_.shape[0]) 
 
-# natural gradient
+# natural gradient for each optimizer
 nat_grad_ls = nat_grad_factory_generic(gram,  least_sqs)
 nat_grad_cg = nat_grad_factory_generic(gram,  conj_grad, eps=eps)
 
@@ -107,24 +110,21 @@ grid = jnp.linspace(0, 30, 31)
 steps = 0.5**grid
 ls_update = grid_line_search_factory(loss, steps)
 
-# errors
+# errors: 0 -> least sqs, 1 -> conj grad
 error_0 = lambda x: model(params_0, x) - u_star(x)
 error_1 = lambda x: model(params_1, x) - u_star(x)
 
 v_error_0 = vmap(error_0, (0))
 v_error_1 = vmap(error_1, (0))
-v_error_abs_grad_0 = vmap(
-        lambda x: jnp.dot(grad(error_0)(x), grad(error_0)(x))**0.5
-        )
-v_error_abs_grad_1 = vmap(
-        lambda x: jnp.dot(grad(error_1)(x), grad(error_1)(x))**0.5
-        )
+v_error_abs_grad_0 = vmap(lambda x: jnp.dot(grad(error_0)(x), grad(error_0)(x))**0.5)
+v_error_abs_grad_1 = vmap(lambda x: jnp.dot(grad(error_1)(x), grad(error_1)(x))**0.5)
 
 def l2_norm(f, integrator):
     return integrator(lambda x: (f(x))**2)**0.5    
    
 # natural gradient descent with line search
-iterations = 500
+
+# many containers
 losses_0 = np.zeros(iterations)
 losses_1 = np.zeros(iterations)
 l2_errors_0 = np.zeros(iterations)
@@ -133,16 +133,21 @@ h1_errors_0 = np.zeros(iterations)
 h1_errors_1 = np.zeros(iterations)
 
 for iteration in range(iterations):
+    #graidents
     grads_0 = grad(loss)(params_0)
     grads_1 = grad(loss)(params_1)
 
+    # natural gradients
     nat_grads_ls = nat_grad_ls(params_0, grads_0)
     nat_grads_cg = nat_grad_cg(params_1, grads_1)
 
+    # update
+    params_ls = params_0
+    params_cg = params_1
     params_0, actual_step_0 = ls_update(params_0, nat_grads_ls)
     params_1, actual_step_1 = ls_update(params_1, nat_grads_cg)
 
-
+    # record losses and errors
     losses_0[iteration] = loss(params_0)
     losses_1[iteration] = loss(params_1)
     l2_errors_0[iteration] = l2_norm(v_error_0, eval_integrator)
@@ -151,9 +156,31 @@ for iteration in range(iterations):
     h1_errors_1[iteration] = l2_errors_1[iteration] + l2_norm(v_error_abs_grad_1, eval_integrator)
 
     if iteration % 50 == 0:
-        # errors
-        #l2_error = l2_norm(v_error, eval_integrator)
-        #h1_error = l2_error + l2_norm(v_error_abs_grad, eval_integrator)
+        gram_cg = gram(params_0, eps=eps)
+        gram_ls = gram(params_1)
+
+        cg_data = {"gram": gram_cg,
+                   "params":params_cg, 
+                   "update": actual_step_0,
+                   "param_new": params_0,
+                   "loss": losses_0[iteration], 
+                   "natgrad": nat_grads_cg,
+                   "error": l2_errors_0[iteration],
+                }
+        
+        ls_data = {"gram": gram_ls,
+                     "params":params_ls, 
+                     "update": actual_step_1,
+                     "param_new": params_1,
+                     "loss": losses_1[iteration], 
+                     "natgrad": nat_grads_ls,
+                     "error": l2_errors_1[iteration],
+                 }
+        
+        data = {"cg": cg_data, "ls": ls_data}
+
+        jnp.save(f'/Users/mauriciodiaz.ortiz/Documents/Radboud_Phd/NaturalGradients/NaturalGradientTraining/data/poisson_1D/poisson_pinn_1d_{iteration}.npy', data)
+
         print(f'iteration: {iteration}')
         print('-'*20)
         print(
@@ -165,32 +192,7 @@ for iteration in range(iterations):
         )
         print('-'*20)
 
+if plot:
+    poission_1d_plot(model, params_0, params_1, l2_errors_0, h1_errors_0, l2_errors_1, 
+                     h1_errors_1, losses_0, losses_1, omega, a, b)
 
-fig, ax = plt.subplots(1, 3, figsize=(12, 5))
-
-#fig.add_subplot(1, 2, 1)
-points = jnp.linspace(a, b, 100).reshape(-1, 1)
-ax[0].plot(points, (jnp.sin(omega*jnp.pi * points)), label=r'$u^{*}(x)$')
-ax[0].plot(points, [model(params_0, point) for point in points], 'o', label=r'$f_{ls}(x; \theta)$')
-ax[0].plot(points, [model(params_1, point) for point in points], '.', label=r'$f_{cg}(x; \theta)$')
-ax[0].legend()
-ax[0].set_xlabel('x')
-ax[0].set_ylabel('u(x)')
-
-ax[1].semilogy(l2_errors_0, label='LS: L2 error')
-ax[1].semilogy(h1_errors_0, label='LS: H1 error')
-ax[1].semilogy(l2_errors_1, label='CG: L2 error')
-ax[1].semilogy(h1_errors_1, label='CG: H1 error')
-ax[1].legend()
-ax[1].set_xlabel('iteration')
-ax[1].set_ylabel('error')
-
-ax[2].semilogy(losses_0, label='LS')
-ax[2].semilogy(losses_1, label='CG')
-ax[2].legend()
-ax[2].set_xlabel('iteration')
-ax[2].set_ylabel('loss')
-
-fig.suptitle('1D Poisson Equation')
-plt.tight_layout()
-plt.show()
