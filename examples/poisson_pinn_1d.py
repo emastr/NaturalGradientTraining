@@ -24,9 +24,9 @@ seed = 2
 a = 0.
 b = 1.
 omega = 4.
-eps = 0.001
+eps = 1e-4
 
-conj_grad=lambda A, b: cg(A, b, maxiter=20)[0]
+conj_grad=lambda A, b: cg(A, b, maxiter=500)[0]
 least_sqs=lambda A, b: lstsq(A, b, rcond=1e-10)[0]
 
 # domains
@@ -72,7 +72,7 @@ gram_laplace = gram_factory(
 )
 
 @jit
-def gram(params):
+def gram(params, eps=0):
     gram_ = gram_laplace(params) + gram_bdry(params)
     #grad_, _ =  jax.flatten_util.ravel_pytree(grad(loss)(params))
     #grad_norm_ = jnp.linalg.norm(grad_)
@@ -81,7 +81,7 @@ def gram(params):
 
 # natural gradient
 nat_grad_ls = nat_grad_factory_generic(gram,  least_sqs)
-nat_grad_cg = nat_grad_factory_generic(gram,  conj_grad)
+nat_grad_cg = nat_grad_factory_generic(gram,  conj_grad, eps=eps)
 
 # trick to get the signature (params, v_x) -> v_residual
 _residual = lambda params: laplace(lambda x: model(params, x))
@@ -124,7 +124,7 @@ def l2_norm(f, integrator):
     return integrator(lambda x: (f(x))**2)**0.5    
    
 # natural gradient descent with line search
-iterations = 150
+iterations = 500
 losses_0 = np.zeros(iterations)
 losses_1 = np.zeros(iterations)
 l2_errors_0 = np.zeros(iterations)
