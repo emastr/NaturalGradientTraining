@@ -424,6 +424,42 @@ class Interval(Hyperrectangle):
             )
         return jnp.reshape(x, (N, 1))
 
+class PointBoundary():
+    """
+    Additional class to accomodate point boundaries. (For 1D problems)
+    """
+    def __init__(self, intervals):
+        self._intervals = jnp.array(intervals).reshape(1, 2)
+        self._l_bounds = self._intervals[:, 0]
+        self._r_bounds = self._intervals[:, 1]
+        
+        if not jnp.all(self._l_bounds < self._r_bounds):
+            raise ValueError(
+                f'[In constructor of PointBoundary]: The '
+                f'l_bounds must be smaller than the r_bounds.'
+                )
+
+        self._dimension = len(self._l_bounds)
+        
+    def measure(self) -> float:
+        return self._r_bounds - self._l_bounds
+
+    @typechecker
+    def random_integration_points():
+        pass
+    
+    @typechecker    
+    def deterministic_integration_points(
+                self, 
+                N: int
+           ) -> Float[Array, "2 1"]:
+        
+        # end points of the interval
+        a = self._l_bounds[0]
+        b = self._r_bounds[0]
+        
+        return jnp.asarray([a, b]).reshape(2, 1) 
+    
 class RectangleBoundary(Domain):
     """
     One side of a rectangle as a domain.
