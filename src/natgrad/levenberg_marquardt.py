@@ -120,6 +120,7 @@ class LevenbergMarquardt(base.IterativeSolver):
   geodesic: bool = False
   contribution_ratio_threshold = 0.75
 
+  materialize_jac: int = 3
   verbose: bool = False
   jac_fun: Optional[Callable[..., jnp.ndarray]] = None
   materialize_jac: bool = False
@@ -128,7 +129,6 @@ class LevenbergMarquardt(base.IterativeSolver):
   has_aux: bool = False
   jit: base.AutoOrBoolean = 'auto'
   unroll: base.AutoOrBoolean = 'auto'
-  callback: Callable = lambda *x: None
 
   # We are overriding the _cond_fun of the base solver to enable stopping based
   # on gradient or delta_params
@@ -147,8 +147,7 @@ class LevenbergMarquardt(base.IterativeSolver):
     else:
       raise NotImplementedError
 
-  def init_state(self, init_params: Any, *args,
-                 **kwargs) -> LevenbergMarquardtState:
+  def init_state(self, init_params: Any, *args, **kwargs) -> LevenbergMarquardtState:
     """Initialize the solver state.
 
     Args:
@@ -161,21 +160,24 @@ class LevenbergMarquardt(base.IterativeSolver):
     """
     # Compute actual values of state variables at init_param
     residual, aux = self._fun_with_aux(init_params, *args, **kwargs)
+    hess_res = None
 
-    if self.materialize_jac:
+    if self.materialize_jac == 1:
       jac = self._jac_fun(init_params, *args, **kwargs)
       jt = jac.T
       jtj = jt @ jac
       gradient = jt @ residual
       damping_factor = self.damping_parameter * jnp.max(jnp.diag(jtj))
-      if self.geodesic:
-        hess_res = self._hess_res_fun(init_params, *args, **kwargs)
-      else:
-        hess_res = None
+    
+    elif self.materialize_jac == 2:
+      jt = self._jac_fun(init_params, *args, **kwargs).T
+      jtj = None
+      gradient = jt @ residual
+      damping_factor = self.damping_parameter * jnp.max(jnp.linalg.norm(jt, axis=0)**2)
+      
     else:
       jt = None
       jtj = None
-      hess_res = None
       gradient = self._jt_op(init_params, residual, *args, **kwargs)
       jtj_diag = self._jtj_diag_op(init_params, *args, **kwargs)
       damping_factor = self.damping_parameter * jnp.max(jtj_diag)
@@ -217,25 +219,29 @@ class LevenbergMarquardt(base.IterativeSolver):
 
       # Calculate gradient based on Eq. 6.6 of "Introduction to optimization
       # and data fitting" g=JT * r, where J is jacobian and r is residual.
-      if self.materialize_jac:
+      hess_res = None
+      if self.materialize_jac == 1:
         # Calculate Jacobian and it's transpose based on the updated coeffs.
         jac = self._jac_fun(params, *args, **kwargs)
         jt = jac.T
         #  J^T.J is the gauss newton approximate hessian.
         jtj = jt @ jac
         gradient = jt @ residual
-        if self.geodesic:
-          hess_res = self._hess_res_fun(params, *args, **kwargs)
-        else:
-          hess_res = None
+          
+      elif self.materialize_jac == 2:
+        # Calculate Jacobian and it's transpose based on the updated coeffs.
+        jac = self._jac_fun(params, *args, **kwargs)
+        jt = jac.T
+        jtj = None
+        gradient = jt @ residual
+          
       else:
         jt = None
         jtj = None
         hess_res = None
         gradient = self._jt_op(params, residual, *args, **kwargs)
 
-      damping_factor = damping_factor * jax.lax.max(1 / 3, 1 -
-                                                    (2 * gain_ratio - 1)**3)
+      damping_factor = damping_factor * jax.lax.max(1 / 3, 1 - (2 * gain_ratio - 1)**3)
       increase_factor = 2
 
       return params, damping_factor, increase_factor, residual, gradient, jt, jtj, hess_res, aux
@@ -329,59 +335,25 @@ class LevenbergMarquardt(base.IterativeSolver):
 
     # For geodesic acceleration, we calculate  jtrpp=JT * r",
     # where J is jacobian and r" is second order directional derivative.
-    if self.materialize_jac:
+    if self.materialize_jac == 0:
       damping_term = state.damping_factor * jnp.identity(params.size)
-      # Note that instead of taking the inverse of jtj_corr and multiply that
-      # by state.gradient, we are using `solve`, which uses LU decomposition of
-      # jtj_corr and uses that to obtain velocity. This has the advantage of
-      # lower number of floating point operations and therefore less numerical
-      # error which can be helpful for the case of single precision arithmatics.
       jtj_corr = state.jtj + damping_term
       velocity = jnp.linalg.solve(jtj_corr, state.gradient)
       delta_params = velocity
-      if self.geodesic:
-        rpp = (state.hess_res @ velocity) @ velocity
-        # Note the same as above here that we could use inverse of jtj_corr but
-        # chose to use solve for higher performance and lower numerical error.
-        acceleration = jnp.linalg.solve(jtj_corr, state.jt)
-        acceleration = acceleration @ rpp
-        delta_params += 0.5*acceleration
+    
+    elif self.materialize_jac == 1:
+      matvec = lambda v: self._semi_jtj_op(v, state.jt, *args, **kwargs)
+      velocity = self.solver(matvec, state.gradient, ridge=state.damping_factor, init=state.delta)
+      delta_params = velocity
+      
     else:
       matvec = lambda v: self._jtj_op(params, v, *args, **kwargs)
-      if isinstance(self.solver, Callable):
-        velocity = self.solver(
-            matvec, state.gradient, ridge=state.damping_factor, init=state.delta)
-        delta_params = velocity
-        if self.geodesic:
-          rpp = self._d2fvv_op(params, velocity, velocity, *args, **kwargs)
-          jtrpp = self._jt_op(params, rpp, *args, **kwargs)
-          acceleration = self.solver(matvec, jtrpp, ridge=state.damping_factor)
-          delta_params += 0.5*acceleration
-      elif self.solver == 'cholesky':
-        velocity = solve_cholesky(matvec, state.gradient, ridge=state.damping_factor)
-        delta_params = velocity
-        if self.geodesic:
-          rpp = self._d2fvv_op(params, velocity, velocity, *args, **kwargs)
-          jtrpp = self._jt_op(params, rpp, *args, **kwargs)
-          acceleration = solve_cholesky(matvec, jtrpp, ridge=state.damping_factor)
-          delta_params += 0.5*acceleration
-      elif self.solver == 'inv':
-        velocity = solve_inv(
-            matvec, state.gradient, ridge=state.damping_factor)
-        delta_params = velocity
-        if self.geodesic:
-          rpp = self._d2fvv_op(params, velocity, velocity, *args, **kwargs)
-          jtrpp = self._jt_op(params, rpp, *args, **kwargs)
-          acceleration = solve_inv(matvec, jtrpp, ridge=state.damping_factor)
-          delta_params += 0.5*acceleration
-
-    if self.geodesic:
-      contribution_ratio_diff = jnp.linalg.norm(acceleration) / jnp.linalg.norm(
-          velocity) - self.contribution_ratio_threshold
-    else:
-      contribution_ratio_diff = 0.0
-
+      velocity = self.solver(matvec, state.gradient, ridge=state.damping_factor, init=state.delta)
+      delta_params = velocity
+      
+      
     delta_params = -delta_params
+    contribution_ratio_diff = 0.0
 
     # Checking if the dparams satisfy the "sufficiently small" criteria.
     params, damping_factor, increase_factor, residual, gradient, jt, jtj, hess_res, aux = (
@@ -406,8 +378,6 @@ class LevenbergMarquardt(base.IterativeSolver):
         jtj=jtj,
         hess_res=hess_res,
         aux=aux)
-    
-    self.callback(params, delta_params, state)
 
     return base.OptStep(params=params, state=state)
 
@@ -448,6 +418,10 @@ class LevenbergMarquardt(base.IterativeSolver):
     _, jvp_val = jax.jvp(fun_with_args, (params,), (vec,))
     jtj_op_val, = vjpfun(jvp_val)
     return jtj_op_val
+  
+  def _semi_jtj_op(self, vec, jt, *args, **kwargs):
+    """Product of J^T.J with vec using vjp & jvp, where J is jacobian of fun at params."""
+    return jt @ (jt.T @ vec)
 
   def _jtj_diag_op(self, params, *args, **kwargs):
     """Diagonal elements of J^T.J, where J is jacobian of fun at params."""
