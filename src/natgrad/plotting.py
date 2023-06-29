@@ -51,7 +51,6 @@ def plot_2d_funcs(funcs, domain, axList: List[plt.Axes], N=200, same_vlim=False,
     return [ax.pcolormesh(X, Y, Z, vmin=vmin, vmax=vmax, **kwargs) for ax, Z in zip(axList, Zlist)]
 
 
-
 def remove_axes(ax):
     """
     Remove axes from plot.

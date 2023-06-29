@@ -21,35 +21,22 @@ from typing import Union
 
 from dataclasses import dataclass
 
+from typing import Tuple
 from typing_extensions import Literal
 import jax
 import jax.numpy as jnp
 
+from jax import jit
 from jaxopt._src import base
 from jaxopt._src.linear_solve import solve_cg
 from jaxopt._src.linear_solve import solve_cholesky
 from jaxopt._src.linear_solve import solve_inv
+from jax.numpy.linalg import lstsq
 from jaxopt._src.tree_util import tree_l2_norm, tree_inf_norm, tree_sub, tree_add, tree_mul
 
 
-class LevenbergMarquardtState(NamedTuple):
-  """Named tuple containing state information."""
-  iter_num: int
-  damping_factor: float
-  increase_factor: float
-  residual: Any
-  loss: Any
-  delta: Any
-  error: float
-  gradient: Any
-  jt: Any
-  jtj: Any
-  hess_res: Any
-  aux: Optional[Any] = None
-
-
 @dataclass(eq=False)
-class LevenbergMarquardt(base.IterativeSolver):
+class LevenbergMarquardt():
   """Levenberg-Marquardt nonlinear least-squares solver.
 
     Given the residual function `func` (x): R^n -> R^m, `least_squares` finds a
@@ -107,224 +94,26 @@ class LevenbergMarquardt(base.IterativeSolver):
     "Introduction to Optimization and Data Fitting".
   """
   residual_fun: Callable
-
   maxiter: int = 30
-
   damping_parameter: float = 1e-6
   scale_invariant: bool = True
-  stop_criterion: Literal['grad-l2-norm', 'madsen-nielsen'] = 'grad-l2-norm'
-  tol: float = 1e-3
-  xtol: float = 1e-3
-  gtol: float = 1e-3
-
   solver: Union[Literal['cholesky', 'inv'], Callable] = solve_cg
-  geodesic: bool = False
-  contribution_ratio_threshold = 0.75
-
   materialize_jac: int = 'semi'
-  verbose: bool = False
-  jac_fun: Optional[Callable[..., jnp.ndarray]] = None
-  materialize_jac: bool = False
-  implicit_diff: bool = True
-  implicit_diff_solve: Optional[Callable] = None
   has_aux: bool = False
-  jit: base.AutoOrBoolean = 'auto'
-  unroll: base.AutoOrBoolean = 'auto'
 
-  # We are overriding the _cond_fun of the base solver to enable stopping based
-  # on gradient or delta_params
-  def _cond_fun(self, inputs):
-    params, state = inputs[0]
-    if self.verbose:
-      print_iteration(state)
-    if self.stop_criterion == 'madsen-nielsen':
-      tree_mul_term = self.xtol * (tree_l2_norm(params) - self.xtol)
-      return jnp.all(jnp.array([
-        tree_inf_norm(state.gradient) > self.gtol,
-        tree_l2_norm(state.delta) > tree_mul_term
-      ]))
-    elif self.stop_criterion == 'grad-l2-norm':
-      return state.error > self.tol
+
+  def __post_init__(self):
+    if self.has_aux:
+      self._fun_with_aux = self.residual_fun
+      self._fun = lambda *a, **kw: self._fun_with_aux(*a, **kw)[0]
     else:
-      raise NotImplementedError
+      self._fun = self.residual_fun
+      self._fun_with_aux = lambda *a, **kw: (self.residual_fun(*a, **kw), None)
+    # For geodesic acceleration, we define Hessian of the residual function.
+    if self.materialize_jac == 'full' or self.materialize_jac == 'semi':
+      self._jac_fun = jax.jacfwd(self._fun, argnums=(0))  
 
-  def init_state(self, init_params: Any, *args, **kwargs) -> LevenbergMarquardtState:
-    """Initialize the solver state.
-
-    Args:
-      init_params: pytree containing the initial parameters.
-      *args: additional positional arguments to be passed to ``residual_fun``.
-      **kwargs: additional keyword arguments to be passed to ``residual_fun``.
-
-    Returns:
-      state
-    """
-    # Compute actual values of state variables at init_param
-    residual, aux = self._fun_with_aux(init_params, *args, **kwargs)
-    hess_res = None
-
-    if self.materialize_jac == 'full':
-      jac = self._jac_fun(init_params, *args, **kwargs)
-      jt = jac.T
-      jtj = jt @ jac
-      gradient = jt @ residual
-      damping_factor = self.damping_parameter * jnp.max(jnp.diag(jtj))
-    
-    elif self.materialize_jac == 'semi':
-      jt = self._jac_fun(init_params, *args, **kwargs).T
-      jtj = None
-      gradient = jt @ residual
-      damping_factor = self.damping_parameter * jnp.max(jnp.linalg.norm(jt, axis=0)**2)
-      
-    elif self.materialize_jac == 'none':
-      jt = None
-      jtj = None
-      gradient = self._jt_op(init_params, residual, *args, **kwargs)
-      jtj_diag = self._jtj_diag_op(init_params, *args, **kwargs)
-      damping_factor = self.damping_parameter * jnp.max(jtj_diag)
-    else:
-      raise ValueError('materialize_jac should be one of "full", "semi", or "none".')
-
-    delta_params = jnp.zeros_like(init_params)
-
-    if self.verbose:
-      print_header()
-
-    return LevenbergMarquardtState(
-        iter_num=jnp.asarray(0),
-        damping_factor=damping_factor,
-        increase_factor=2,
-        error=tree_l2_norm(gradient),
-        residual=residual,
-        loss=0.5 * (residual @ residual),
-        delta=delta_params,
-        gradient=gradient,
-        jt=jt,
-        jtj=jtj,
-        hess_res=hess_res,
-        aux=aux)
-
-  def update_state_using_gain_ratio(self, gain_ratio, contribution_ratio_diff,
-                                    gain_ratio_test_init_state, *args,
-                                    **kwargs):
-    """The function to return state variables based on gain ratio.
-      Please see by page 120-121 of the book "Introduction to Optimization and
-      Data Fitting" by K. Madsen & H. B. Nielsen for details.
-    """
-
-    def gain_ratio_test_true_func(params, damping_factor,
-                                  increase_factor, residual, gradient, jt, jtj,
-                                  hess_res, updated_params, aux):
-
-      params = updated_params
-
-      residual, aux = self._fun_with_aux(params, *args, **kwargs)
-
-      # Calculate gradient based on Eq. 6.6 of "Introduction to optimization
-      # and data fitting" g=JT * r, where J is jacobian and r is residual.
-      hess_res = None
-      if self.materialize_jac == 'full':
-        # Calculate Jacobian and it's transpose based on the updated coeffs.
-        jac = self._jac_fun(params, *args, **kwargs)
-        jt = jac.T
-        #  J^T.J is the gauss newton approximate hessian.
-        jtj = jt @ jac
-        gradient = jt @ residual
-          
-      elif self.materialize_jac == 'semi':
-        # Calculate Jacobian and it's transpose based on the updated coeffs.
-        jac = self._jac_fun(params, *args, **kwargs)
-        jt = jac.T
-        jtj = None
-        gradient = jt @ residual
-          
-      elif self.materialize_jac == 'none':
-        jt = None
-        jtj = None
-        hess_res = None
-        gradient = self._jt_op(params, residual, *args, **kwargs)
-      else:
-        raise ValueError('materialize_jac should be one of "full", "semi", or "none".')
-
-      damping_factor = damping_factor * jax.lax.max(1 / 3, 1 - (2 * gain_ratio - 1)**3)
-      increase_factor = 2
-
-      return params, damping_factor, increase_factor, residual, gradient, jt, jtj, hess_res, aux
-
-    def gain_ratio_test_false_func(params, damping_factor,
-                                   increase_factor, residual, gradient, jt, jtj,
-                                   hess_res, updated_params, aux):
-
-      damping_factor = damping_factor * increase_factor
-      increase_factor = 2 * increase_factor
-      return params, damping_factor, increase_factor, residual, gradient, jt, jtj, hess_res, aux
-
-    # Calling the jax condition function:
-    # Note that only the parameters that are used in the rest of the program
-    # are returned by this function.
-
-    gain_ratio_test_is_met = jnp.logical_and(gain_ratio > 0.0,
-                                             contribution_ratio_diff <= 0.0)
-
-    gain_ratio_test_is_met_ret = gain_ratio_test_true_func(
-        *gain_ratio_test_init_state)
-    gain_ratio_test_not_met_ret = gain_ratio_test_false_func(
-        *gain_ratio_test_init_state)
-
-    gain_ratio_test_is_met_ret = jax.tree_map(
-        lambda x: gain_ratio_test_is_met * x, gain_ratio_test_is_met_ret)
-
-    gain_ratio_test_not_met_ret = jax.tree_map(
-        lambda x: (1.0 - gain_ratio_test_is_met) * x,
-        gain_ratio_test_not_met_ret)
-
-    params, damping_factor, increase_factor, residual, gradient, jt, jtj, hess_res, aux = jax.tree_map(
-        lambda x, y: x + y, gain_ratio_test_is_met_ret,
-        gain_ratio_test_not_met_ret)
-
-    return params, damping_factor, increase_factor, residual, gradient, jt, jtj, hess_res, aux
-
-  def update_state_using_delta_params(self, loss_curr, params, delta_params,
-                                      contribution_ratio_diff, damping_factor,
-                                      increase_factor, residual, gradient, jt,
-                                      jtj, hess_res, aux, *args, **kwargs):
-    """The function to return state variables based on delta_params.
-
-    Define the functions required for the major conditional of the algorithm,
-    which checks the magnitude of dparams and checks if it is small enough.
-    for the value of dparams.
-    """
-
-    updated_params = params + delta_params
-
-    residual_next = self._fun(updated_params, *args, **kwargs)
-
-    # Calculate denominator of the gain ratio based on Eq. 6.16, "Introduction
-    # to optimization and data fitting", L(0)-L(hlm)=0.5*hlm^T*(mu*hlm-g).
-    gain_ratio_denom = 0.5 * delta_params.T @ (
-        damping_factor * delta_params - gradient)
-
-    # Current value of loss function F=0.5*||f||^2.
-    loss_next = 0.5 * (residual_next @ residual_next)
-
-    gain_ratio = (loss_curr - loss_next) / gain_ratio_denom
-
-    gain_ratio_test_init_state = (params, damping_factor, increase_factor,
-                                  residual, gradient, jt, jtj, hess_res,
-                                  updated_params, aux)
-
-    # Calling the jax condition function:
-    # Note that only the parameters that are used in the rest of the program
-    # are returned by this function.
-
-    params, damping_factor, increase_factor, residual, gradient, jt, jtj, hess_res, aux = (
-        self.update_state_using_gain_ratio(gain_ratio, contribution_ratio_diff,
-                                           gain_ratio_test_init_state, *args,
-                                           **kwargs))
-
-    return params, damping_factor, increase_factor, residual, gradient, jt, jtj, hess_res, aux
-
-  def update(self, params, state: NamedTuple, *args, **kwargs) -> base.OptStep:
+  def update(self, params, *args, **kwargs) -> Tuple:
     """Performs one iteration of the least-squares solver.
 
     Args:
@@ -336,89 +125,43 @@ class LevenbergMarquardt(base.IterativeSolver):
     """
 
     # Current value of the loss function F=0.5*||f||^2.
-    loss_curr = state.loss
     
-    if self.scale_invariant:
-      damping_factor = state.damping_factor
-    else:
-      damping_factor = self.damping_parameter
-
+    residual, aux = self._fun_with_aux(params, *args, **kwargs)
     # For geodesic acceleration, we calculate  jtrpp=JT * r",
     # where J is jacobian and r" is second order directional derivative.
     if self.materialize_jac == 'full':
-      damping_term = damping_factor * jnp.identity(params.size) #state.damping_parameter
-      jtj_corr = state.jtj + damping_term
-      #velocity = jnp.linalg.solve(jtj_corr, state.gradient)
-      
-      matvec = lambda v: jtj_corr @ v + damping_factor * v
-      velocity = self.solver(matvec, state.gradient, init=state.delta)
-      delta_params = velocity
+      jac = self._jac_fun(params, *args, **kwargs)
+      jt = jac.T
+      jtj = jt @ jac
+      gradient = jt @ residual
+      damping_factor  = self.damping_parameter * jnp.max(jnp.diag(jtj)) if self.scale_invariant else self.damping_parameter
+      jtj_corr = jtj + damping_factor * jnp.identity(params.size) 
+      nat_grad = lstsq(jtj_corr, gradient)[0]
     
     elif self.materialize_jac == 'semi':
-      matvec = lambda v: self._semi_jtj_op(v, state.jt, *args, **kwargs)
-      velocity = self.solver(matvec, state.gradient, init=state.delta, ridge=damping_factor)
-      delta_params = velocity
+      jac = self._jac_fun(params, *args, **kwargs)
+      jt = jac.T
+      jtj = None
+      gradient = jt @ residual
+      matvec = lambda v: self._semi_jtj_op(v, jt, *args, **kwargs)
+      damping_factor = self.damping_parameter * jnp.max(jnp.linalg.norm(jt, axis=0)**2) if self.scale_invariant else self.damping_parameter
+      nat_grad = self.solver(matvec, gradient, init=gradient, ridge=damping_factor)
       
     elif self.materialize_jac == 'none':
-      matvec = lambda v: self._jtj_op(params, v, *args, **kwargs)
-      velocity = self.solver(matvec, state.gradient, init=state.delta, ridge=damping_factor)
-      delta_params = velocity
+      jt = None
+      jtj = None
+      gradient = self._jt_op(params, residual, *args, **kwargs)
+      matvec = jit(lambda v: self._jtj_op(params, v, *args, **kwargs))
+      jtj_diag = self._jtj_diag_op(params, *args, **kwargs)
+      damping_factor = self.damping_parameter * jnp.max(jtj_diag) if self.scale_invariant else self.damping_parameter
+      nat_grad = self.solver(matvec, gradient, init=gradient, ridge=damping_factor)
       
     else:
       raise ValueError('materialize_jac should be one of "full", "semi", or "none".')
-      
-      
-    delta_params = -delta_params
-    contribution_ratio_diff = 0.0
 
     # Checking if the dparams satisfy the "sufficiently small" criteria.
-    params, damping_factor, increase_factor, residual, gradient, jt, jtj, hess_res, aux = (
-        self.update_state_using_delta_params(loss_curr, params, delta_params,
-                                             contribution_ratio_diff,
-                                             state.damping_factor,
-                                             state.increase_factor,
-                                             state.residual, state.gradient,
-                                             state.jt, state.jtj,
-                                             state.hess_res, state.aux, *args, **kwargs))
+    return nat_grad, gradient, 0.5*(residual @ residual)
 
-    state = LevenbergMarquardtState(
-        iter_num=state.iter_num + 1,
-        damping_factor=damping_factor,
-        increase_factor=increase_factor,
-        error=tree_l2_norm(gradient),
-        residual=residual,
-        loss=0.5 * (residual @ residual),
-        delta=delta_params,
-        gradient=gradient,
-        jt=jt,
-        jtj=jtj,
-        hess_res=hess_res,
-        aux=aux)
-
-    return base.OptStep(params=params, state=state)
-
-  def __post_init__(self):
-    if self.has_aux:
-      self._fun_with_aux = self.residual_fun
-      self._fun = lambda *a, **kw: self._fun_with_aux(*a, **kw)[0]
-    else:
-      self._fun = self.residual_fun
-      self._fun_with_aux = lambda *a, **kw: (self.residual_fun(*a, **kw), None)
-    # For geodesic acceleration, we define Hessian of the residual function.
-    if self.materialize_jac and self.jac_fun is None:
-      self._jac_fun = jax.jacfwd(self._fun, argnums=(0))
-      if self.geodesic:
-        self._hess_res_fun = jax.jacfwd(
-            jax.jacfwd(self._fun, argnums=(0)), argnums=(0))
-    elif not self.materialize_jac and self.jac_fun:
-      self._jac_fun = self.jac_fun
-      if self.geodesic:
-        self._hess_res_fun = jax.jacfwd(self.jac_fun, argnums=(0))
-
-  def optimality_fun(self, params, *args, **kwargs):
-    """Optimality function mapping compatible with ``@custom_root``."""
-    residual = self._fun(params, *args, **kwargs)
-    return self._jt_op(params, residual, *args, **kwargs)
 
   def _jt_op(self, params, residual, *args, **kwargs):
     """Product of J^T and residual -- J: jacobian of fun at params."""
@@ -451,10 +194,3 @@ class LevenbergMarquardt(base.IterativeSolver):
     g = lambda pr: jax.jvp(fun_with_args, (pr,), (tangents1,))[1]
     return jax.jvp(g, (primals,), (tangents2,))[1]
 
-
-def print_header():
-  print(f"{'Iteration':^15}{'Cost':^15}{'||Gradient||':^15}{'Damping Factor':^15}")
-
-
-def print_iteration(state: LevenbergMarquardtState):
-  print(f"{state.iter_num:^15}{state.loss:^15.4e}{state.error:^15.4e}{state.damping_factor:^15.4}")
