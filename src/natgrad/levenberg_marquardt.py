@@ -111,6 +111,7 @@ class LevenbergMarquardt(base.IterativeSolver):
   maxiter: int = 30
 
   damping_parameter: float = 1e-6
+  scale_invariant: bool = True
   stop_criterion: Literal['grad-l2-norm', 'madsen-nielsen'] = 'grad-l2-norm'
   tol: float = 1e-3
   xtol: float = 1e-3
@@ -120,7 +121,7 @@ class LevenbergMarquardt(base.IterativeSolver):
   geodesic: bool = False
   contribution_ratio_threshold = 0.75
 
-  materialize_jac: int = 3
+  materialize_jac: int = 'semi'
   verbose: bool = False
   jac_fun: Optional[Callable[..., jnp.ndarray]] = None
   materialize_jac: bool = False
@@ -162,25 +163,27 @@ class LevenbergMarquardt(base.IterativeSolver):
     residual, aux = self._fun_with_aux(init_params, *args, **kwargs)
     hess_res = None
 
-    if self.materialize_jac == 1:
+    if self.materialize_jac == 'full':
       jac = self._jac_fun(init_params, *args, **kwargs)
       jt = jac.T
       jtj = jt @ jac
       gradient = jt @ residual
       damping_factor = self.damping_parameter * jnp.max(jnp.diag(jtj))
     
-    elif self.materialize_jac == 2:
+    elif self.materialize_jac == 'semi':
       jt = self._jac_fun(init_params, *args, **kwargs).T
       jtj = None
       gradient = jt @ residual
       damping_factor = self.damping_parameter * jnp.max(jnp.linalg.norm(jt, axis=0)**2)
       
-    else:
+    elif self.materialize_jac == 'none':
       jt = None
       jtj = None
       gradient = self._jt_op(init_params, residual, *args, **kwargs)
       jtj_diag = self._jtj_diag_op(init_params, *args, **kwargs)
       damping_factor = self.damping_parameter * jnp.max(jtj_diag)
+    else:
+      raise ValueError('materialize_jac should be one of "full", "semi", or "none".')
 
     delta_params = jnp.zeros_like(init_params)
 
@@ -220,7 +223,7 @@ class LevenbergMarquardt(base.IterativeSolver):
       # Calculate gradient based on Eq. 6.6 of "Introduction to optimization
       # and data fitting" g=JT * r, where J is jacobian and r is residual.
       hess_res = None
-      if self.materialize_jac == 1:
+      if self.materialize_jac == 'full':
         # Calculate Jacobian and it's transpose based on the updated coeffs.
         jac = self._jac_fun(params, *args, **kwargs)
         jt = jac.T
@@ -228,18 +231,20 @@ class LevenbergMarquardt(base.IterativeSolver):
         jtj = jt @ jac
         gradient = jt @ residual
           
-      elif self.materialize_jac == 2:
+      elif self.materialize_jac == 'semi':
         # Calculate Jacobian and it's transpose based on the updated coeffs.
         jac = self._jac_fun(params, *args, **kwargs)
         jt = jac.T
         jtj = None
         gradient = jt @ residual
           
-      else:
+      elif self.materialize_jac == 'none':
         jt = None
         jtj = None
         hess_res = None
         gradient = self._jt_op(params, residual, *args, **kwargs)
+      else:
+        raise ValueError('materialize_jac should be one of "full", "semi", or "none".')
 
       damping_factor = damping_factor * jax.lax.max(1 / 3, 1 - (2 * gain_ratio - 1)**3)
       increase_factor = 2
@@ -332,24 +337,35 @@ class LevenbergMarquardt(base.IterativeSolver):
 
     # Current value of the loss function F=0.5*||f||^2.
     loss_curr = state.loss
+    
+    if self.scale_invariant:
+      damping_factor = state.damping_factor
+    else:
+      damping_factor = self.damping_parameter
 
     # For geodesic acceleration, we calculate  jtrpp=JT * r",
     # where J is jacobian and r" is second order directional derivative.
-    if self.materialize_jac == 0:
-      damping_term = state.damping_factor * jnp.identity(params.size)
+    if self.materialize_jac == 'full':
+      damping_term = damping_factor * jnp.identity(params.size) #state.damping_parameter
       jtj_corr = state.jtj + damping_term
-      velocity = jnp.linalg.solve(jtj_corr, state.gradient)
+      #velocity = jnp.linalg.solve(jtj_corr, state.gradient)
+      
+      matvec = lambda v: jtj_corr @ v + damping_factor * v
+      velocity = self.solver(matvec, state.gradient, init=state.delta)
       delta_params = velocity
     
-    elif self.materialize_jac == 1:
+    elif self.materialize_jac == 'semi':
       matvec = lambda v: self._semi_jtj_op(v, state.jt, *args, **kwargs)
-      velocity = self.solver(matvec, state.gradient, ridge=state.damping_factor, init=state.delta)
+      velocity = self.solver(matvec, state.gradient, init=state.delta, ridge=damping_factor)
+      delta_params = velocity
+      
+    elif self.materialize_jac == 'none':
+      matvec = lambda v: self._jtj_op(params, v, *args, **kwargs)
+      velocity = self.solver(matvec, state.gradient, init=state.delta, ridge=damping_factor)
       delta_params = velocity
       
     else:
-      matvec = lambda v: self._jtj_op(params, v, *args, **kwargs)
-      velocity = self.solver(matvec, state.gradient, ridge=state.damping_factor, init=state.delta)
-      delta_params = velocity
+      raise ValueError('materialize_jac should be one of "full", "semi", or "none".')
       
       
     delta_params = -delta_params
@@ -421,7 +437,8 @@ class LevenbergMarquardt(base.IterativeSolver):
   
   def _semi_jtj_op(self, vec, jt, *args, **kwargs):
     """Product of J^T.J with vec using vjp & jvp, where J is jacobian of fun at params."""
-    return jt @ (jt.T @ vec)
+    vec_ = jt.T @ vec
+    return jt @ vec_
 
   def _jtj_diag_op(self, params, *args, **kwargs):
     """Diagonal elements of J^T.J, where J is jacobian of fun at params."""
