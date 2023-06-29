@@ -74,11 +74,11 @@ def nat_grad_factory(gram: GramEvalType) -> ParamType:
 
 @jaxtyped
 @typechecker
-def nat_grad_factory_generic(gram: GramEvalType, solver, **kwargs) -> ParamType:
+def nat_grad_factory_generic(gram: GramEvalType, solver, eps=0, **kwargs) -> ParamType:
     # maps: [(*,*), ..., (*,*)], [(*,*), ..., (*,*)] ---> [(*,*), ..., (*,*)]
     def natural_gradient(params: PyTree, tangent_params: PyTree) -> PyTree:
         
-        gram_matrix = gram(params)
+        gram_matrix = gram(params, eps)
         flat_tangent, to_pytree  = jax.flatten_util.ravel_pytree(tangent_params)
         
         # solve gram dot flat_tangent.
