@@ -38,6 +38,9 @@ def grid_line_search_factory(loss, steps):
     
     return grid_line_search_update
 
+
+
+
 #------------some PDE trafos--------------------------#
 
 model_del_0 = model_del_i_factory(argnum=0)

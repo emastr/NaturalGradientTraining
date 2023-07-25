@@ -49,15 +49,10 @@ def u_star(xt):
 def f(xt):
     return 0.
 
-# gramians
-gram_bdry_time = gram_factory(model = model, trafo = model_identity, integrator = boundary_time)
-gram_bdry_space_1 = gram_factory(model = model, trafo = model_identity, integrator = boundary_integ_space_1)
-gram_bdry_space_2 = gram_factory(model = model, trafo = model_identity, integrator = boundary_integ_space_2)
-gram_laplace = gram_factory(model = model, trafo = burger, integrator = interior_integrator)
 
-@jit
-def gram(params):
-    return gram_laplace(params) + gram_bdry(params)
+def residual(params, x):
+    grad_ = grad(model, 1)(params, x)
+    
 
 # natural gradient
 nat_grad = nat_grad_factory(gram)

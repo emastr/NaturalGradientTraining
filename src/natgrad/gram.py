@@ -38,7 +38,7 @@ def pre_gram_factory(model: ModelType, trafo: TrafoType) -> GramFuncType:
 
     return pre_gram
 
-    
+
     
     
 @jaxtyped

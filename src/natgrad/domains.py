@@ -541,7 +541,8 @@ class RectangleBoundary(Domain):
 
         # number of points in [a_0, b_0] and [a_1, b_1]
         M_0 = jnp.maximum(math.ceil((b_0 - a_0) * N), 1)
-        M_1 = jnp.maximum(math.ceil((b_1 - a_1) * N), 1)
+        #M_1 = jnp.maximum(math.ceil((b_1 - a_1) * N), 1)
+        M_1 = M_0
 
         # points in the four sides
         points_0 = random.uniform(keys[0], (M_0, 1), minval=a_0, maxval=b_0)
@@ -550,7 +551,7 @@ class RectangleBoundary(Domain):
         points_3 = random.uniform(keys[3], (M_1, 1), minval=a_1, maxval=b_1)
 
         # padding
-        a_0_s = a_0 * jnp.ones(shape = (M_0, 1))
+        a_0_s = a_0 * jnp.ones(shape = (M_1, 1))
         b_0_s = b_0 * jnp.ones(shape = (M_1, 1))
         a_1_s = a_1 * jnp.ones(shape = (M_0, 1))
         b_1_s = b_1 * jnp.ones(shape = (M_0, 1))
@@ -565,6 +566,7 @@ class RectangleBoundary(Domain):
         # of shape (n, 2)
         if self._side_number == None:
             return jnp.reshape(jnp.array(sides), (-1,2))
+            #return jnp.concatenate(sides, axis = 0)
         else:
             return jnp.reshape(
                 jnp.array(sides[self._side_number]), 

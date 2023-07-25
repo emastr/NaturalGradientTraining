@@ -12,8 +12,7 @@ def default_axis(func):
     return new_func
     
 
-@default_axis
-def plot_2d_func(func, domain, ax: plt.Axes, N=200, **kwargs):
+def plot_2d_func(func, domain, N=200, ax: plt.Axes = None, **kwargs):
     """Plot a 2d domain.
 
     Args:
