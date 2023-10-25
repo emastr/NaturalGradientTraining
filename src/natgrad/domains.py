@@ -226,7 +226,7 @@ class Hyperrectangle(Domain):
         return self._dimension
 
     def measure(self) -> float:
-        return jnp.product(self._r_bounds - self._l_bounds)
+        return jnp.prod(self._r_bounds - self._l_bounds)
 
     def inside(self, x: PointType) -> bool:
         """
@@ -286,7 +286,7 @@ class Hyperrectangle(Domain):
             dimension of the Hyperrectangle.
         """
         
-        return jnp.product((x - self._l_bounds) * (x - self._r_bounds))
+        return jnp.prod((x - self._l_bounds) * (x - self._r_bounds))
 
 class Cube(Hyperrectangle):
     """
